@@ -1,0 +1,177 @@
+/*
+ * Tailwind v4 entry: config lives here, with no tailwind.config.js or PostCSS plugin.
+ * - Keep every @import in this top block, above @theme and the rest of the file. Install an
+ *   npm package before @importing its CSS. Never @import a remote URL (web fonts, CDN CSS): the
+ *   build resolves @import from the filesystem. Load those with a <link> in the head() of
+ *   src/routes/__root.tsx and name the family in a --font-* token in @theme inline below.
+ */
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Design system definition.
+ *
+ * The design lives in this file: oklch color tokens on the shadcn variables
+ * (--background, --foreground, --primary, --secondary, --muted, --accent, ...) plus
+ * new tokens as needed, font tokens, and custom styles and animations.
+ *
+ * The @theme inline block maps CSS custom properties to Tailwind utility
+ * classes (e.g. --color-primary -> bg-primary, text-primary).
+ *
+ * The :root and .dark blocks define the actual color values using oklch.
+ * All colors MUST use oklch format.
+ *
+ * To add a new semantic color:
+ * 1. Add the variable to :root (light value) and .dark (dark value)
+ * 2. Register it in @theme inline as --color-<name>: var(--<name>)
+ */
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ring-offset-background: var(--background);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 0.375rem;
+  --background: oklch(0.16 0.014 148);
+  --foreground: oklch(0.94 0.012 110);
+  --card: oklch(0.2 0.015 148);
+  --card-foreground: oklch(0.94 0.012 110);
+  --popover: oklch(0.2 0.015 148);
+  --popover-foreground: oklch(0.94 0.012 110);
+  --primary: oklch(0.89 0.17 119);
+  --primary-foreground: oklch(0.19 0.03 135);
+  --secondary: oklch(0.25 0.017 148);
+  --secondary-foreground: oklch(0.94 0.012 110);
+  --muted: oklch(0.23 0.014 148);
+  --muted-foreground: oklch(0.68 0.018 142);
+  --accent: oklch(0.3 0.028 177);
+  --accent-foreground: oklch(0.91 0.035 171);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.98 0.01 90);
+  --border: oklch(0.32 0.016 148);
+  --input: oklch(0.32 0.016 148);
+  --ring: oklch(0.89 0.17 119);
+  --signal: oklch(0.84 0.18 156);
+  --signal-muted: oklch(0.33 0.09 155);
+  --coral: oklch(0.74 0.15 37);
+  --cyan: oklch(0.82 0.11 191);
+  --feed-stage: oklch(0.12 0.012 150);
+  --font-sans: "DM Sans", sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --chart-1: oklch(0.84 0.18 156);
+  --chart-2: oklch(0.82 0.11 191);
+  --chart-3: oklch(0.74 0.15 37);
+  --chart-4: oklch(0.89 0.17 119);
+  --chart-5: oklch(0.69 0.12 300);
+  --sidebar: oklch(0.14 0.013 148);
+  --sidebar-foreground: oklch(0.94 0.012 110);
+  --sidebar-primary: oklch(0.89 0.17 119);
+  --sidebar-primary-foreground: oklch(0.19 0.03 135);
+  --sidebar-accent: oklch(0.23 0.014 148);
+  --sidebar-accent-foreground: oklch(0.91 0.035 171);
+  --sidebar-border: oklch(0.32 0.016 148);
+  --sidebar-ring: oklch(0.89 0.17 119);
+}
+
+.dark {
+  --background: oklch(0.16 0.014 148);
+  --foreground: oklch(0.94 0.012 110);
+  --card: oklch(0.2 0.015 148);
+  --card-foreground: oklch(0.94 0.012 110);
+  --popover: oklch(0.2 0.015 148);
+  --popover-foreground: oklch(0.94 0.012 110);
+  --primary: oklch(0.89 0.17 119);
+  --primary-foreground: oklch(0.19 0.03 135);
+  --secondary: oklch(0.25 0.017 148);
+  --secondary-foreground: oklch(0.94 0.012 110);
+  --muted: oklch(0.23 0.014 148);
+  --muted-foreground: oklch(0.68 0.018 142);
+  --accent: oklch(0.3 0.028 177);
+  --accent-foreground: oklch(0.91 0.035 171);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.98 0.01 90);
+  --border: oklch(0.32 0.016 148);
+  --input: oklch(0.32 0.016 148);
+  --ring: oklch(0.89 0.17 119);
+  --chart-1: oklch(0.84 0.18 156);
+  --chart-2: oklch(0.82 0.11 191);
+  --chart-3: oklch(0.74 0.15 37);
+  --chart-4: oklch(0.89 0.17 119);
+  --chart-5: oklch(0.69 0.12 300);
+  --sidebar: oklch(0.14 0.013 148);
+  --sidebar-foreground: oklch(0.94 0.012 110);
+  --sidebar-primary: oklch(0.89 0.17 119);
+  --sidebar-primary-foreground: oklch(0.19 0.03 135);
+  --sidebar-accent: oklch(0.23 0.014 148);
+  --sidebar-accent-foreground: oklch(0.91 0.035 171);
+  --sidebar-border: oklch(0.32 0.016 148);
+  --sidebar-ring: oklch(0.89 0.17 119);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+  }
+}
+
+.type-display {
+  font-family: var(--font-display);
+}
+
+.mono-data {
+  font-family: "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.feed-noise {
+  background-image: radial-gradient(oklch(0.74 0.025 148 / 16%) 0.7px, transparent 0.7px);
+  background-size: 9px 9px;
+}

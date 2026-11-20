@@ -26,3 +26,10 @@ export function createViewerLink(origin: string, token: string): string {
   url.searchParams.set("room", token);
   return url.toString();
 }
+
+export function countActiveViewers(presence: Record<string, Array<{ role?: string }>>): number {
+  return Object.values(presence).reduce(
+    (count, presences) => count + presences.filter((item) => item.role === "viewer").length,
+    0,
+  );
+}

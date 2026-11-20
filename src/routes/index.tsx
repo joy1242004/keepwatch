@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   Activity,
@@ -36,15 +36,27 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { supabase } from "@/integrations/supabase/client";
-import { createRoomToken, createViewerLink, parseRoomToken } from "@/lib/camera-room";
+import {
+  countActiveViewers,
+  createRoomToken,
+  createViewerLink,
+  parseRoomToken,
+} from "@/lib/camera-room";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Keepwatch — Private live camera" },
-      { name: "description", content: "Turn your phone into a private live camera. Watch from anywhere, check its battery, and reconnect automatically." },
+      {
+        name: "description",
+        content:
+          "Turn your phone into a private live camera. Watch from anywhere, check its battery, and reconnect automatically.",
+      },
       { property: "og:title", content: "Keepwatch — Private live camera" },
-      { property: "og:description", content: "A private live camera and device monitor for the places that matter." },
+      {
+        property: "og:description",
+        content: "A private live camera and device monitor for the places that matter.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
     ],
@@ -71,16 +83,20 @@ type SignalMessage = {
 const ICE_SERVERS: RTCConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
+const CAMERA_ROOM_STORAGE_KEY = "keepwatch-camera-room";
+const VIEWER_ROOM_STORAGE_KEY = "keepwatch-viewer-room";
 
 function Keepwatch() {
   const [mode, setMode] = useState<AppMode>("camera");
   const [room, setRoom] = useState<string | null>(null);
+  const [pairedRoom, setPairedRoom] = useState<string | null>(null);
   const [viewerInput, setViewerInput] = useState("");
   const [cameraActive, setCameraActive] = useState(false);
   const [facing, setFacing] = useState<"environment" | "user">("environment");
   const [cameraError, setCameraError] = useState("");
   const [viewerError, setViewerError] = useState("");
   const [status, setStatus] = useState<ConnectionStatus>("offline");
+  const statusRef = useRef(status);
   const [copied, setCopied] = useState(false);
   const [online, setOnline] = useState(true);
   const [battery, setBattery] = useState<BatteryInfo>(null);
@@ -94,6 +110,13 @@ function Keepwatch() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraStartPromiseRef = useRef<Promise<void> | null>(null);
+  const cameraStartGenerationRef = useRef(0);
+  const cameraStartFailedRef = useRef(false);
+  const cameraRetryRef = useRef<() => void>(() => undefined);
+  const activeViewerCountRef = useRef(0);
+  const facingRef = useRef(facing);
+  const batteryRef = useRef(battery);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const candidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
@@ -102,21 +125,65 @@ function Keepwatch() {
   const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startedAtRef = useRef(0);
 
-  const viewerLink = room ? createViewerLink(window.location.origin, room) : "";
+  const cameraPaired = Boolean(pairedRoom && mode === "camera" && pairedRoom === room);
+  const viewerLink = cameraPaired && room ? createViewerLink(window.location.origin, room) : "";
   const viewerIsConnected = mode === "viewer" && status === "connected";
 
   useEffect(() => {
-    const token = new URLSearchParams(window.location.search).get("room");
-    if (!token) return;
-    const parsed = parseRoomToken(token);
-    if (!parsed) {
+    const urlToken = new URLSearchParams(window.location.search).get("room");
+    const parsedUrlToken = urlToken ? parseRoomToken(urlToken) : null;
+    let storedCameraRoom: string | null = null;
+    let storedViewerRoom: string | null = null;
+    try {
+      storedCameraRoom = parseRoomToken(localStorage.getItem(CAMERA_ROOM_STORAGE_KEY) ?? "");
+      storedViewerRoom = parseRoomToken(localStorage.getItem(VIEWER_ROOM_STORAGE_KEY) ?? "");
+    } catch {
+      setViewerError("This browser could not access saved pairings. Check its storage settings.");
+    }
+
+    if (urlToken && !parsedUrlToken) {
       setViewerError("This viewing link is not valid. Ask the camera owner for a new link.");
       return;
     }
-    setRoom(parsed);
-    setViewerInput(window.location.href);
-    setMode("viewer");
+    if (parsedUrlToken && parsedUrlToken === storedCameraRoom) {
+      setPairedRoom(storedCameraRoom);
+      setRoom(storedCameraRoom);
+      return;
+    }
+    if (parsedUrlToken) {
+      setRoom(parsedUrlToken);
+      setViewerInput(window.location.href);
+      setMode("viewer");
+      try {
+        localStorage.setItem(VIEWER_ROOM_STORAGE_KEY, parsedUrlToken);
+      } catch {
+        setViewerError("This link works for now, but this browser could not save the pairing.");
+      }
+      return;
+    }
+    if (storedCameraRoom) {
+      setPairedRoom(storedCameraRoom);
+      setRoom(storedCameraRoom);
+      return;
+    }
+    if (storedViewerRoom) {
+      setRoom(storedViewerRoom);
+      setViewerInput(createViewerLink(window.location.origin, storedViewerRoom));
+      setMode("viewer");
+    }
   }, []);
+
+  useEffect(() => {
+    facingRef.current = facing;
+  }, [facing]);
+
+  useEffect(() => {
+    batteryRef.current = battery;
+  }, [battery]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   useEffect(() => {
     const syncNetwork = () => setOnline(navigator.onLine);
@@ -131,22 +198,28 @@ function Keepwatch() {
     window.addEventListener("offline", syncNetwork);
     connection?.addEventListener("change", syncType);
 
-    let batteryDevice: EventTarget & { level: number; charging: boolean } | null = null;
+    let batteryDevice: (EventTarget & { level: number; charging: boolean }) | null = null;
     let mounted = true;
     const syncBattery = () => {
       if (batteryDevice && mounted) {
-        setBattery({ level: Math.round(batteryDevice.level * 100), charging: batteryDevice.charging });
+        setBattery({
+          level: Math.round(batteryDevice.level * 100),
+          charging: batteryDevice.charging,
+        });
       }
     };
     const batteryApi = (navigator as NetworkInfo).getBattery;
     if (batteryApi) {
-      batteryApi.call(navigator).then((device) => {
-        if (!mounted) return;
-        batteryDevice = device;
-        syncBattery();
-        batteryDevice.addEventListener("levelchange", syncBattery);
-        batteryDevice.addEventListener("chargingchange", syncBattery);
-      }).catch(() => setBatterySupported(false));
+      batteryApi
+        .call(navigator)
+        .then((device) => {
+          if (!mounted) return;
+          batteryDevice = device;
+          syncBattery();
+          batteryDevice.addEventListener("levelchange", syncBattery);
+          batteryDevice.addEventListener("chargingchange", syncBattery);
+        })
+        .catch(() => setBatterySupported(false));
     } else {
       setBatterySupported(false);
     }
@@ -162,7 +235,8 @@ function Keepwatch() {
   }, []);
 
   useEffect(() => {
-    if (cameraActive && localVideoRef.current) localVideoRef.current.srcObject = cameraStreamRef.current;
+    if (cameraActive && localVideoRef.current)
+      localVideoRef.current.srcObject = cameraStreamRef.current;
   }, [cameraActive, mode]);
 
   useEffect(() => {
@@ -180,8 +254,18 @@ function Keepwatch() {
     return () => window.clearInterval(timer);
   }, [cameraActive]);
 
+  const releaseCameraStream = useCallback(() => {
+    cameraStartGenerationRef.current += 1;
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    cameraStreamRef.current = null;
+    peerRef.current?.close();
+    peerRef.current = null;
+    setCameraActive(false);
+    setStatus("offline");
+  }, []);
+
   useEffect(() => {
-    if (!room || (mode === "camera" && !cameraActive)) return;
+    if (!room || (mode === "camera" && !cameraPaired)) return;
     let cancelled = false;
     let localChannel: ReturnType<typeof supabase.channel> | null = null;
     let connectionRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -201,6 +285,92 @@ function Keepwatch() {
       peerRef.current?.close();
       peerRef.current = null;
       candidateQueueRef.current = [];
+    };
+
+    const startCameraForViewer = async () => {
+      if (cameraStreamRef.current || cameraStartPromiseRef.current || cameraStartFailedRef.current)
+        return;
+      const generation = cameraStartGenerationRef.current;
+      const request = (async () => {
+        try {
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new DOMException(
+              "Camera access requires HTTPS and a supported browser.",
+              "NotSupportedError",
+            );
+          }
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              facingMode: { ideal: facingRef.current },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 24, max: 30 },
+            },
+          });
+          if (
+            generation !== cameraStartGenerationRef.current ||
+            activeViewerCountRef.current === 0 ||
+            cancelled
+          ) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          cameraStreamRef.current = stream;
+          startedAtRef.current = Date.now();
+          setCameraActive(true);
+          const track = stream.getVideoTracks()[0];
+          const dimensions = track?.getSettings();
+          if (dimensions?.width && dimensions.height)
+            setStreamSize(`${dimensions.width} × ${dimensions.height}`);
+        } catch (error) {
+          cameraStartFailedRef.current = true;
+          const name = error instanceof DOMException ? error.name : "";
+          if (name === "NotAllowedError" || name === "SecurityError") {
+            setCameraError(
+              "Camera permission is blocked. Allow camera access, then retry while a viewer is waiting.",
+            );
+          } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+            setCameraError("No compatible camera was found on this device.");
+          } else {
+            setCameraError(
+              "The camera could not start. Check that no other app is using it, then retry.",
+            );
+          }
+          setStatus("retrying");
+        }
+      })();
+      cameraStartPromiseRef.current = request;
+      await request;
+      if (cameraStartPromiseRef.current === request) cameraStartPromiseRef.current = null;
+      if (
+        !cameraStreamRef.current &&
+        activeViewerCountRef.current > 0 &&
+        cameraPaired &&
+        !cameraStartFailedRef.current &&
+        !cancelled
+      ) {
+        void startCameraForViewer();
+      }
+    };
+    cameraRetryRef.current = () => {
+      cameraStartFailedRef.current = false;
+      void startCameraForViewer();
+    };
+
+    const syncViewerPresence = () => {
+      if (mode !== "camera" || !localChannel) return;
+      const viewerCount = countActiveViewers(localChannel.presenceState<{ role: string }>());
+      const hadViewers = activeViewerCountRef.current > 0;
+      activeViewerCountRef.current = viewerCount;
+      if (viewerCount > 0) {
+        if (!hadViewers) cameraStartFailedRef.current = false;
+        void startCameraForViewer();
+      } else {
+        cameraStartFailedRef.current = false;
+        releaseCameraStream();
+        void sendSignal({ kind: "camera-status", battery: null, size: "Waiting for viewer" });
+      }
     };
 
     const makePeer = (role: AppMode) => {
@@ -238,37 +408,50 @@ function Keepwatch() {
         }
       };
       peer.oniceconnectionstatechange = () => {
-        if (peer.iceConnectionState === "failed") {
-          void peer.restartIce?.();
-        }
+        if (peer.iceConnectionState === "failed") void peer.restartIce?.();
       };
       if (role === "viewer") {
         peer.ontrack = (event) => {
           const [receivedStream] = event.streams;
-          if (receivedStream) {
-            setRemoteStream(receivedStream);
-          } else {
-            const singleTrackStream = new MediaStream([event.track]);
-            setRemoteStream(singleTrackStream);
-          }
+          setRemoteStream(receivedStream ?? new MediaStream([event.track]));
         };
       } else {
-        cameraStreamRef.current?.getTracks().forEach((track) => peer.addTrack(track, cameraStreamRef.current as MediaStream));
+        const stream = cameraStreamRef.current;
+        stream?.getTracks().forEach((track) => peer.addTrack(track, stream));
       }
       return peer;
     };
 
     const sendViewerRequest = () => {
       const now = Date.now();
-      if (now - lastWatchRequestRef.current < 3000 || !online || !localChannel || localChannel.state !== "joined") return;
+      if (
+        now - lastWatchRequestRef.current < 3000 ||
+        !online ||
+        !localChannel ||
+        localChannel.state !== "joined"
+      )
+        return;
       lastWatchRequestRef.current = now;
       void sendSignal({ kind: "watch" });
+    };
+
+    const publishCameraDetails = () => {
+      if (cancelled || !localChannel || localChannel.state !== "joined") return;
+      const track = cameraStreamRef.current?.getVideoTracks()[0];
+      const dimensions = track?.getSettings();
+      const size =
+        dimensions?.width && dimensions.height
+          ? `${dimensions.width} × ${dimensions.height}`
+          : "Waiting for viewer";
+      if (track) setStreamSize(size);
+      void sendSignal({ kind: "camera-status", battery: batteryRef.current, size });
     };
 
     localChannel = supabase.channel(`keepwatch-${room}`, {
       config: { broadcast: { self: false } },
     });
     channelRef.current = localChannel;
+    localChannel.on("presence", { event: "sync" }, syncViewerPresence);
 
     localChannel.on("broadcast", { event: "signal" }, ({ payload }) => {
       if (cancelled) return;
@@ -278,50 +461,67 @@ function Keepwatch() {
         const camera = message.battery;
         setRemoteBattery(camera && typeof camera.level === "number" ? camera : null);
         if (typeof message.size === "string") setStreamSize(message.size);
-        if (status === "offline") setStatus("connecting");
+        if (statusRef.current === "offline") setStatus("connecting");
         return;
       }
 
-      if (message.kind === "watch" && mode === "camera" && cameraActive) {
+      if (message.kind === "watch" && mode === "camera" && activeViewerCountRef.current > 0) {
         const existingPeer = peerRef.current;
         if (existingPeer && existingPeer.connectionState !== "closed") {
           const connectingTooLong = Date.now() - peerStartedRef.current > 12000;
           if (existingPeer.connectionState === "connected" || !connectingTooLong) return;
         }
-        const peer = makePeer("camera");
-        setStatus("connecting");
-        void peer.createOffer().then(async (offer) => {
-          if (peerRef.current !== peer) return;
-          await peer.setLocalDescription(offer);
-          await sendSignal({ kind: "offer", description: offer });
-        }).catch(() => setStatus("retrying"));
+        void startCameraForViewer().then(() => {
+          if (cancelled || activeViewerCountRef.current === 0 || !cameraStreamRef.current) return;
+          const peer = makePeer("camera");
+          setStatus("connecting");
+          void peer
+            .createOffer()
+            .then(async (offer) => {
+              if (peerRef.current !== peer) return;
+              await peer.setLocalDescription(offer);
+              await sendSignal({ kind: "offer", description: offer });
+            })
+            .catch(() => setStatus("retrying"));
+        });
         return;
       }
 
       if (message.kind === "offer" && mode === "viewer" && message.description) {
         const peer = makePeer("viewer");
         setStatus("connecting");
-        void peer.setRemoteDescription(message.description).then(async () => {
-          for (const candidate of candidateQueueRef.current.splice(0)) {
-            await peer.addIceCandidate(candidate).catch(() => undefined);
-          }
-          const answer = await peer.createAnswer();
-          await peer.setLocalDescription(answer);
-          await sendSignal({ kind: "answer", description: answer });
-        }).catch(() => {
-          setViewerError("Couldn’t open the live feed. Reconnecting now.");
-          setStatus("retrying");
-        });
+        void peer
+          .setRemoteDescription(message.description)
+          .then(async () => {
+            for (const candidate of candidateQueueRef.current.splice(0)) {
+              await peer.addIceCandidate(candidate).catch(() => undefined);
+            }
+            const answer = await peer.createAnswer();
+            await peer.setLocalDescription(answer);
+            await sendSignal({ kind: "answer", description: answer });
+          })
+          .catch(() => {
+            setViewerError("Couldn’t open the live feed. Reconnecting now.");
+            setStatus("retrying");
+          });
         return;
       }
 
-      if (message.kind === "answer" && mode === "camera" && message.description && peerRef.current) {
+      if (
+        message.kind === "answer" &&
+        mode === "camera" &&
+        message.description &&
+        peerRef.current
+      ) {
         const peer = peerRef.current;
-        void peer.setRemoteDescription(message.description).then(async () => {
-          for (const candidate of candidateQueueRef.current.splice(0)) {
-            await peer.addIceCandidate(candidate).catch(() => undefined);
-          }
-        }).catch(() => setStatus("retrying"));
+        void peer
+          .setRemoteDescription(message.description)
+          .then(async () => {
+            for (const candidate of candidateQueueRef.current.splice(0)) {
+              await peer.addIceCandidate(candidate).catch(() => undefined);
+            }
+          })
+          .catch(() => setStatus("retrying"));
         return;
       }
 
@@ -339,34 +539,32 @@ function Keepwatch() {
       if (cancelled) return;
       if (channelStatus === "SUBSCRIBED") {
         setStatus(mode === "viewer" ? "connecting" : "offline");
+        void localChannel
+          ?.track({ role: mode })
+          .then(() => {
+            if (mode === "camera") syncViewerPresence();
+          })
+          .catch(() => setStatus("retrying"));
         if (mode === "viewer") {
           lastWatchRequestRef.current = 0;
           sendViewerRequest();
+        } else {
+          publishCameraDetails();
         }
       }
-      if (channelStatus === "CHANNEL_ERROR" || channelStatus === "TIMED_OUT" || channelStatus === "CLOSED") {
+      if (
+        channelStatus === "CHANNEL_ERROR" ||
+        channelStatus === "TIMED_OUT" ||
+        channelStatus === "CLOSED"
+      ) {
         setStatus("retrying");
+        if (mode === "camera") releaseCameraStream();
       }
     });
 
-    if (mode === "camera" && cameraActive) {
-      const publishCameraDetails = () => {
-        if (cancelled || !localChannel || localChannel.state !== "joined") return;
-        const track = cameraStreamRef.current?.getVideoTracks()[0];
-        const dimensions = track?.getSettings();
-        const size = dimensions?.width && dimensions.height ? `${dimensions.width} × ${dimensions.height}` : "Live";
-        setStreamSize(size);
-        void sendSignal({ kind: "camera-status", battery, size });
-      };
-      const statusTimer = window.setInterval(publishCameraDetails, 12000);
-      localChannel.on("broadcast", { event: "signal" }, ({ payload }) => {
-        if ((payload as SignalMessage).kind === "watch") publishCameraDetails();
-      });
-      localChannel.subscribe((channelStatus) => {
-        if (channelStatus === "SUBSCRIBED") publishCameraDetails();
-      });
-      retryTimerRef.current = statusTimer;
-    }
+    localChannel.on("broadcast", { event: "signal" }, ({ payload }) => {
+      if (mode === "camera" && (payload as SignalMessage).kind === "watch") publishCameraDetails();
+    });
 
     const handleOnline = () => {
       setOnline(true);
@@ -378,6 +576,12 @@ function Keepwatch() {
     const handleOffline = () => {
       setOnline(false);
       setStatus("retrying");
+      if (mode === "camera") {
+        activeViewerCountRef.current = 0;
+        cameraStartFailedRef.current = false;
+        cameraRetryRef.current = () => undefined;
+        releaseCameraStream();
+      }
     };
     const requestFocusReconnect = () => {
       if (document.visibilityState === "visible" && mode === "viewer") {
@@ -400,6 +604,8 @@ function Keepwatch() {
           }
         }
       }, 2500);
+    } else {
+      retryTimerRef.current = window.setInterval(publishCameraDetails, 12000);
     }
 
     return () => {
@@ -410,11 +616,12 @@ function Keepwatch() {
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", requestFocusReconnect);
       stopPeer();
+      if (mode === "camera") releaseCameraStream();
       setRemoteStream(null);
       if (channelRef.current === localChannel) channelRef.current = null;
       if (localChannel) void supabase.removeChannel(localChannel);
     };
-  }, [room, mode, cameraActive, online, battery]);
+  }, [room, mode, cameraPaired, online, releaseCameraStream]);
 
   async function startCamera() {
     setCameraError("");
@@ -425,37 +632,51 @@ function Keepwatch() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } },
+        video: {
+          facingMode: { ideal: facing },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
       });
-      cameraStreamRef.current = stream;
-      startedAtRef.current = Date.now();
+      stream.getTracks().forEach((track) => track.stop());
       const token = createRoomToken();
+      localStorage.setItem(CAMERA_ROOM_STORAGE_KEY, token);
+      setPairedRoom(token);
       window.history.replaceState({}, "", `${window.location.pathname}?room=${token}`);
       setRoom(token);
-      setCameraActive(true);
-      const track = stream.getVideoTracks()[0];
-      const dimensions = track?.getSettings();
-      if (dimensions?.width && dimensions.height) setStreamSize(`${dimensions.width} × ${dimensions.height}`);
+      setCameraActive(false);
     } catch (error) {
       const name = error instanceof DOMException ? error.name : "";
       if (name === "NotAllowedError" || name === "SecurityError") {
-        setCameraError("Camera permission is blocked. Allow camera access in your browser settings, then try again.");
+        setCameraError(
+          "Camera permission is blocked. Allow camera access in your browser settings, then try again.",
+        );
       } else if (name === "NotFoundError" || name === "OverconstrainedError") {
         setCameraError("No compatible camera was found on this device.");
+      } else if (error instanceof DOMException && error.name === "QuotaExceededError") {
+        setCameraError(
+          "This browser cannot save the pairing. Free up browser storage and try again.",
+        );
       } else {
-        setCameraError("The camera could not start. Check that no other app is using it, then try again.");
+        setCameraError(
+          "The camera could not be paired. Check camera access and browser storage, then try again.",
+        );
       }
     }
   }
 
-  function stopCamera() {
-    void channelRef.current?.send({ type: "broadcast", event: "signal", payload: { kind: "camera-status", battery: null, size: "Camera paused" } });
-    peerRef.current?.close();
-    peerRef.current = null;
-    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
-    cameraStreamRef.current = null;
-    setCameraActive(false);
-    setStatus("offline");
+  function unpairCamera() {
+    releaseCameraStream();
+    activeViewerCountRef.current = 0;
+    try {
+      localStorage.removeItem(CAMERA_ROOM_STORAGE_KEY);
+    } catch {
+      setCameraError(
+        "The camera was unpaired for this session, but browser storage could not be cleared.",
+      );
+    }
+    setPairedRoom(null);
     setRoom(null);
     setRemoteStream(null);
     window.history.replaceState({}, "", window.location.pathname);
@@ -470,7 +691,12 @@ function Keepwatch() {
     try {
       const nextStream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: { ideal: nextFacing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } },
+        video: {
+          facingMode: { ideal: nextFacing },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
       });
       cameraStreamRef.current = nextStream;
       oldStream?.getTracks().forEach((track) => track.stop());
@@ -498,10 +724,12 @@ function Keepwatch() {
   }
 
   function openViewer() {
-    if (cameraActive) stopCamera();
+    releaseCameraStream();
     setMode("viewer");
+    setRoom(null);
     setViewerError("");
     setViewerInput("");
+    window.history.replaceState({}, "", window.location.pathname);
   }
 
   function submitViewer(event: FormEvent<HTMLFormElement>) {
@@ -516,34 +744,64 @@ function Keepwatch() {
     setStatus("connecting");
     setRoom(token);
     window.history.replaceState({}, "", `${window.location.pathname}?room=${token}`);
+    try {
+      localStorage.setItem(VIEWER_ROOM_STORAGE_KEY, token);
+    } catch {
+      setViewerError(
+        "The camera will connect, but this browser could not save the pairing for next time.",
+      );
+    }
   }
 
   function openCamera() {
     setMode("camera");
-    setRoom(null);
+    setRoom(pairedRoom);
     setViewerError("");
-    window.history.replaceState({}, "", window.location.pathname);
+    window.history.replaceState(
+      {},
+      "",
+      pairedRoom ? `${window.location.pathname}?room=${pairedRoom}` : window.location.pathname,
+    );
   }
 
   return (
     <main className="min-h-screen bg-background text-foreground">
       <div className="mx-auto flex min-h-screen w-full max-w-[1480px] flex-col px-5 pb-8 pt-4 sm:px-8 lg:px-12 lg:pt-7">
         <header className="flex min-h-14 items-center justify-between border-b border-border/80 pb-4">
-          <a href="/" onClick={openCamera} className="flex items-center gap-2.5" aria-label="Keepwatch home">
+          <a
+            href="/"
+            onClick={openCamera}
+            className="flex items-center gap-2.5"
+            aria-label="Keepwatch home"
+          >
             <BrandMark />
-            <span className="type-display text-[19px] font-semibold tracking-[0]">keepwatch<span className="text-primary">.</span></span>
+            <span className="type-display text-[19px] font-semibold tracking-[0]">
+              keepwatch<span className="text-primary">.</span>
+            </span>
           </a>
           <div className="flex items-center gap-2">
-            <span className={`relative flex size-2 rounded-full ${online ? "bg-[var(--signal)]" : "bg-[var(--coral)]"}`} />
-            <span className="mono-data text-[11px] uppercase tracking-[0] text-muted-foreground">{online ? "Network ready" : "Reconnecting"}</span>
+            <span
+              className={`relative flex size-2 rounded-full ${online ? "bg-[var(--signal)]" : "bg-[var(--coral)]"}`}
+            />
+            <span className="mono-data text-[11px] uppercase tracking-[0] text-muted-foreground">
+              {online ? "Network ready" : "Reconnecting"}
+            </span>
             <span className="mx-1 h-5 w-px bg-border" />
             <Button
               variant="outline"
               size="sm"
-              onClick={() => mode === "camera" ? openViewer() : openCamera()}
+              onClick={() => (mode === "camera" ? openViewer() : openCamera())}
               className="h-9 rounded-sm border-border px-3 text-xs text-foreground"
             >
-              {mode === "camera" ? <><ScanEye className="mr-1.5 size-3.5" /> Watch a camera</> : <><Camera className="mr-1.5 size-3.5" /> Camera</>}
+              {mode === "camera" ? (
+                <>
+                  <ScanEye className="mr-1.5 size-3.5" /> Watch a camera
+                </>
+              ) : (
+                <>
+                  <Camera className="mr-1.5 size-3.5" /> Camera
+                </>
+              )}
             </Button>
           </div>
         </header>
@@ -562,33 +820,95 @@ function Keepwatch() {
                 </h1>
               </div>
               {mode === "camera" && cameraActive && <LiveBadge label="CAMERA ON" />}
-              {mode === "viewer" && <LiveBadge label={viewerIsConnected ? "LIVE FEED" : "MONITOR"} active={viewerIsConnected} />}
+              {mode === "viewer" && (
+                <LiveBadge
+                  label={viewerIsConnected ? "LIVE FEED" : "MONITOR"}
+                  active={viewerIsConnected}
+                />
+              )}
             </div>
 
-            <section className="relative isolate aspect-[4/3] overflow-hidden rounded-[3px] border border-border bg-[var(--feed-stage)] sm:aspect-[16/9] lg:max-h-[580px]" aria-label={mode === "camera" ? "Camera preview" : "Live camera feed"}>
+            <section
+              className="relative isolate aspect-[4/3] overflow-hidden rounded-[3px] border border-border bg-[var(--feed-stage)] sm:aspect-[16/9] lg:max-h-[580px]"
+              aria-label={mode === "camera" ? "Camera preview" : "Live camera feed"}
+            >
               <div className="absolute inset-0 feed-noise opacity-50" />
               <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_48%_46%,oklch(0.29_0.035_157_/_30%),transparent_68%)]" />
-              {mode === "camera" && cameraActive && <video ref={localVideoRef} className="absolute inset-0 size-full object-cover" autoPlay playsInline muted aria-label="Live camera preview" />}
-              {mode === "viewer" && remoteStream && <video ref={remoteVideoRef} className="absolute inset-0 size-full object-contain" autoPlay playsInline aria-label="Live camera feed" />}
+              {mode === "camera" && cameraActive && (
+                <video
+                  ref={localVideoRef}
+                  className="absolute inset-0 size-full object-cover"
+                  autoPlay
+                  playsInline
+                  muted
+                  aria-label="Live camera preview"
+                />
+              )}
+              {mode === "viewer" && remoteStream && (
+                <video
+                  ref={remoteVideoRef}
+                  className="absolute inset-0 size-full object-contain"
+                  autoPlay
+                  playsInline
+                  aria-label="Live camera feed"
+                />
+              )}
 
               {((mode === "camera" && !cameraActive) || (mode === "viewer" && !remoteStream)) && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center px-6 text-center">
                   <div className="mb-5 flex size-[76px] items-center justify-center rounded-full border border-primary/20 bg-primary/[0.07]">
-                    {mode === "camera" ? <Camera className="size-8 text-primary/80" strokeWidth={1.3} /> : <MonitorSmartphone className="size-8 text-primary/80" strokeWidth={1.3} />}
+                    {mode === "camera" ? (
+                      <Camera className="size-8 text-primary/80" strokeWidth={1.3} />
+                    ) : (
+                      <MonitorSmartphone className="size-8 text-primary/80" strokeWidth={1.3} />
+                    )}
                   </div>
                   <p className="type-display text-lg font-medium">
-                    {mode === "camera" ? "Nothing in view. Yet." : !room ? "A familiar place, from anywhere." : status === "retrying" ? "Finding your camera…" : "Waiting for your camera…"}
+                    {mode === "camera"
+                      ? cameraPaired
+                        ? "Paired and standing by"
+                        : "Nothing in view. Yet."
+                      : !room
+                        ? "A familiar place, from anywhere."
+                        : status === "retrying"
+                          ? "Finding your camera…"
+                          : "Waiting for your camera…"}
                   </p>
                   <p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-                    {mode === "camera" ? "Turn this phone into a private live camera in one tap." : !room ? "Add a camera link to start a secure live view." : status === "retrying" ? "We’ll reconnect automatically as soon as the connection is back." : "The live feed will appear as soon as the camera is ready."}
+                    {mode === "camera"
+                      ? cameraPaired
+                        ? "The camera stays off until a viewer connects. Pairing is saved in this browser."
+                        : "Allow camera access to pair. Keepwatch immediately stops the camera and only starts it while a viewer is present."
+                      : !room
+                        ? "Add a camera link to start a secure live view."
+                        : status === "retrying"
+                          ? "We’ll reconnect automatically as soon as the connection is back."
+                          : "The live feed will appear as soon as the camera is ready."}
                   </p>
-                  {mode === "camera" && (
-                    <Button onClick={() => void startCamera()} className="mt-6 h-11 rounded-[3px] px-6 text-sm font-semibold" disabled={!online}>
-                      <Video className="mr-2 size-4" /> Start camera
+                  {mode === "camera" && !cameraPaired && (
+                    <Button
+                      onClick={() => void startCamera()}
+                      className="mt-6 h-11 rounded-[3px] px-6 text-sm font-semibold"
+                      disabled={!online}
+                    >
+                      <Link2 className="mr-2 size-4" /> Pair camera
+                    </Button>
+                  )}
+                  {mode === "camera" && cameraPaired && cameraError && (
+                    <Button
+                      onClick={() => cameraRetryRef.current()}
+                      className="mt-6 h-11 rounded-[3px] px-6 text-sm font-semibold"
+                      disabled={!online || !activeViewerCountRef.current}
+                    >
+                      <RefreshCw className="mr-2 size-4" /> Retry camera
                     </Button>
                   )}
                   {mode === "viewer" && !room && (
-                    <Button variant="outline" onClick={() => inputRef.current?.focus()} className="mt-6 h-10 rounded-[3px] px-5 text-sm">
+                    <Button
+                      variant="outline"
+                      onClick={() => inputRef.current?.focus()}
+                      className="mt-6 h-10 rounded-[3px] px-5 text-sm"
+                    >
                       <Link2 className="mr-2 size-4" /> Add camera link
                     </Button>
                   )}
@@ -599,10 +919,14 @@ function Keepwatch() {
                     </div>
                   )}
                   {cameraError && mode === "camera" && (
-                    <div role="alert" className="mt-4 max-w-md text-sm text-[var(--coral)]">{cameraError}</div>
+                    <div role="alert" className="mt-4 max-w-md text-sm text-[var(--coral)]">
+                      {cameraError}
+                    </div>
                   )}
                   {viewerError && mode === "viewer" && (
-                    <div role="alert" className="mt-4 max-w-md text-sm text-[var(--coral)]">{viewerError}</div>
+                    <div role="alert" className="mt-4 max-w-md text-sm text-[var(--coral)]">
+                      {viewerError}
+                    </div>
                   )}
                 </div>
               )}
@@ -611,16 +935,40 @@ function Keepwatch() {
                 <div className="flex items-center gap-2">
                   {mode === "camera" && cameraActive && <OnAirChip />}
                   {mode === "viewer" && remoteStream && <OnAirChip />}
-                  {mode === "viewer" && !room && <span className="rounded-sm border border-border/80 bg-background/75 px-2 py-1 text-[10px] uppercase text-muted-foreground">Awaiting link</span>}
+                  {mode === "viewer" && !room && (
+                    <span className="rounded-sm border border-border/80 bg-background/75 px-2 py-1 text-[10px] uppercase text-muted-foreground">
+                      Awaiting link
+                    </span>
+                  )}
                 </div>
-                <span className="mono-data rounded-sm border border-border/70 bg-background/75 px-2.5 py-1 text-[10px] text-foreground/75 backdrop-blur-sm">{mode === "camera" && cameraActive ? formatDuration(elapsed) : mode === "viewer" && remoteStream ? streamSize : "KEEPWATCH · 01"}</span>
+                <span className="mono-data rounded-sm border border-border/70 bg-background/75 px-2.5 py-1 text-[10px] text-foreground/75 backdrop-blur-sm">
+                  {mode === "camera" && cameraActive
+                    ? formatDuration(elapsed)
+                    : mode === "viewer" && remoteStream
+                      ? streamSize
+                      : "KEEPWATCH · 01"}
+                </span>
               </div>
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between border-t border-border/60 bg-background/60 px-3.5 py-2.5 backdrop-blur-sm sm:px-5">
                 <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  {online ? <Wifi className="size-3.5 text-[var(--signal)]" /> : <WifiOff className="size-3.5 text-[var(--coral)]" />}
-                  <span>{online ? `${networkType} · encrypted connection` : "Connection interrupted · retrying"}</span>
+                  {online ? (
+                    <Wifi className="size-3.5 text-[var(--signal)]" />
+                  ) : (
+                    <WifiOff className="size-3.5 text-[var(--coral)]" />
+                  )}
+                  <span>
+                    {online
+                      ? `${networkType} · encrypted connection`
+                      : "Connection interrupted · retrying"}
+                  </span>
                 </div>
-                <span className="mono-data hidden text-[10px] text-muted-foreground sm:block">{mode === "camera" ? streamSize : viewerIsConnected ? "PEER TO PEER" : "READY TO CONNECT"}</span>
+                <span className="mono-data hidden text-[10px] text-muted-foreground sm:block">
+                  {mode === "camera"
+                    ? streamSize
+                    : viewerIsConnected
+                      ? "PEER TO PEER"
+                      : "READY TO CONNECT"}
+                </span>
               </div>
             </section>
 
@@ -628,67 +976,192 @@ function Keepwatch() {
               <div className="mt-5">
                 <div className="flex flex-col gap-4 border-b border-border/80 pb-5 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex min-w-0 items-start gap-3">
-                    <div className={`mt-1.5 size-2 shrink-0 rounded-full ${cameraActive ? "animate-pulse bg-[var(--signal)]" : "bg-muted-foreground/45"}`} />
+                    <div
+                      className={`mt-1.5 size-2 shrink-0 rounded-full ${cameraActive ? "animate-pulse bg-[var(--signal)]" : "bg-muted-foreground/45"}`}
+                    />
                     <div>
-                      <p className="text-sm font-medium">{cameraActive ? "Your camera is running" : "Ready when you are"}</p>
-                      <p className="mt-1 text-xs text-muted-foreground">{cameraActive ? "This phone is securely streaming to your link." : "The camera only streams while you choose to leave it on."}</p>
+                      <p className="text-sm font-medium">
+                        {cameraActive
+                          ? "Viewer connected · camera on"
+                          : cameraPaired
+                            ? "Paired · camera off"
+                            : "Ready to pair"}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {cameraActive
+                          ? "The camera turns off when the last viewer leaves."
+                          : cameraPaired
+                            ? "Waiting for a viewer. Pairing is saved on this device."
+                            : "Pair this device to create a private viewing link."}
+                      </p>
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-2">
-                    {cameraActive ? (
-                      <>
-                        <Button variant="outline" onClick={() => void changeCamera()} className="h-9 rounded-[3px] px-3 text-xs"><FlipHorizontal2 className="mr-1.5 size-3.5" /> Flip</Button>
-                        <Button variant="destructive" onClick={stopCamera} className="h-9 rounded-[3px] px-3 text-xs"><VideoOff className="mr-1.5 size-3.5" /> Stop camera</Button>
-                      </>
+                    {cameraActive && (
+                      <Button
+                        variant="outline"
+                        onClick={() => void changeCamera()}
+                        className="h-9 rounded-[3px] px-3 text-xs"
+                      >
+                        <FlipHorizontal2 className="mr-1.5 size-3.5" /> Flip
+                      </Button>
+                    )}
+                    {cameraPaired ? (
+                      <Button
+                        variant="destructive"
+                        onClick={unpairCamera}
+                        className="h-9 rounded-[3px] px-3 text-xs"
+                      >
+                        <VideoOff className="mr-1.5 size-3.5" /> Unpair camera
+                      </Button>
                     ) : (
-                      <Button onClick={() => void startCamera()} disabled={!online} className="h-9 rounded-[3px] px-4 text-xs"><Video className="mr-1.5 size-3.5" /> Start camera</Button>
+                      <Button
+                        onClick={() => void startCamera()}
+                        disabled={!online}
+                        className="h-9 rounded-[3px] px-4 text-xs"
+                      >
+                        <Link2 className="mr-1.5 size-3.5" /> Pair camera
+                      </Button>
                     )}
                   </div>
                 </div>
 
-                {cameraActive && room && (
+                {cameraPaired && room && (
                   <div className="flex flex-col gap-3 border-b border-border/80 py-4 sm:flex-row sm:items-center sm:justify-between">
                     <div className="flex items-start gap-3">
-                      <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-[var(--signal-muted)] text-[var(--signal)]"><Link2 className="size-4" /></div>
+                      <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-[var(--signal-muted)] text-[var(--signal)]">
+                        <Link2 className="size-4" />
+                      </div>
                       <div className="min-w-0">
-                        <p className="text-sm font-medium">Private viewing link</p>
-                        <p className="mt-0.5 text-xs text-muted-foreground">Anyone with this link can view. Share it only with someone you trust.</p>
-                        <Input ref={inputRef} readOnly aria-label="Private camera link" value={viewerLink} onFocus={(event) => event.currentTarget.select()} className="mono-data mt-2.5 h-8 max-w-full rounded-sm border-border bg-secondary/60 text-[10px] text-muted-foreground sm:w-[370px]" />
+                        <p className="text-sm font-medium">Saved private viewing link</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          Saved on this device. Anyone with this link can view; share only with
+                          someone you trust.
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Keep Keepwatch open on the camera device. Mobile browsers may pause camera
+                          access in the background.
+                        </p>
+                        <Input
+                          ref={inputRef}
+                          readOnly
+                          aria-label="Private camera link"
+                          value={viewerLink}
+                          onFocus={(event) => event.currentTarget.select()}
+                          className="mono-data mt-2.5 h-8 max-w-full rounded-sm border-border bg-secondary/60 text-[10px] text-muted-foreground sm:w-[370px]"
+                        />
                       </div>
                     </div>
-                    <Button variant="outline" onClick={() => void handleCopyLink()} className="h-9 w-full shrink-0 rounded-[3px] px-3 text-xs sm:w-auto">
-                      {copied ? <CheckCheck className="mr-1.5 size-3.5 text-[var(--signal)]" /> : <Copy className="mr-1.5 size-3.5" />}{copied ? "Link copied" : "Copy link"}
+                    <Button
+                      variant="outline"
+                      onClick={() => void handleCopyLink()}
+                      className="h-9 w-full shrink-0 rounded-[3px] px-3 text-xs sm:w-auto"
+                    >
+                      {copied ? (
+                        <CheckCheck className="mr-1.5 size-3.5 text-[var(--signal)]" />
+                      ) : (
+                        <Copy className="mr-1.5 size-3.5" />
+                      )}
+                      {copied ? "Link copied" : "Copy link"}
                     </Button>
                   </div>
                 )}
 
                 <div className="flex items-start gap-2.5 py-3 text-[11px] leading-5 text-muted-foreground">
                   <LockKeyhole className="mt-0.5 size-3.5 shrink-0 text-[var(--signal)]" />
-                  <p>Your video goes directly between your devices and is not saved. Keepwatch does not secretly record.</p>
+                  <p>
+                    Your video goes directly between your devices and is not saved. Keepwatch does
+                    not secretly record.
+                  </p>
                 </div>
               </div>
             ) : (
               <div className="mt-5">
-                <form onSubmit={submitViewer} className="flex flex-col gap-2.5 border-b border-border/80 pb-5 sm:flex-row">
-                  <label htmlFor="camera-link" className="sr-only">Paste camera link</label>
+                <form
+                  onSubmit={submitViewer}
+                  className="flex flex-col gap-2.5 border-b border-border/80 pb-5 sm:flex-row"
+                >
+                  <label htmlFor="camera-link" className="sr-only">
+                    Paste camera link
+                  </label>
                   <div className="relative flex-1">
                     <Link2 className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input ref={inputRef} id="camera-link" value={viewerInput} onChange={(event) => setViewerInput(event.target.value)} placeholder="Paste a camera viewing link" className="h-10 rounded-[3px] border-border bg-secondary/45 pl-10 text-sm" />
+                    <Input
+                      ref={inputRef}
+                      id="camera-link"
+                      value={viewerInput}
+                      onChange={(event) => setViewerInput(event.target.value)}
+                      placeholder="Paste a camera viewing link"
+                      className="h-10 rounded-[3px] border-border bg-secondary/45 pl-10 text-sm"
+                    />
                   </div>
-                  <Button type="submit" disabled={!online || !viewerInput.trim()} className="h-10 rounded-[3px] px-5 text-sm">Connect <ExternalLink className="ml-1.5 size-3.5" /></Button>
+                  <Button
+                    type="submit"
+                    disabled={!online || !viewerInput.trim()}
+                    className="h-10 rounded-[3px] px-5 text-sm"
+                  >
+                    Connect <ExternalLink className="ml-1.5 size-3.5" />
+                  </Button>
                 </form>
-                {viewerError && !remoteStream && <p role="alert" className="mt-3 text-sm text-[var(--coral)]">{viewerError}</p>}
+                {viewerError && !remoteStream && (
+                  <p role="alert" className="mt-3 text-sm text-[var(--coral)]">
+                    {viewerError}
+                  </p>
+                )}
                 <div className="flex items-center justify-between gap-4 border-b border-border/80 py-4">
                   <div className="flex items-center gap-3">
-                    <div className={`flex size-8 items-center justify-center rounded-sm ${viewerIsConnected ? "bg-[var(--signal-muted)] text-[var(--signal)]" : "bg-secondary text-muted-foreground"}`}>
-                      {viewerIsConnected ? <CircleDot className="size-4" /> : <RefreshCw className="size-4" />}
+                    <div
+                      className={`flex size-8 items-center justify-center rounded-sm ${viewerIsConnected ? "bg-[var(--signal-muted)] text-[var(--signal)]" : "bg-secondary text-muted-foreground"}`}
+                    >
+                      {viewerIsConnected ? (
+                        <CircleDot className="size-4" />
+                      ) : (
+                        <RefreshCw className="size-4" />
+                      )}
                     </div>
                     <div>
-                      <p className="text-sm font-medium">{viewerIsConnected ? "Live camera connected" : room ? status === "retrying" ? "Reconnecting to camera" : "Connecting to camera" : "Waiting for a link"}</p>
-                      <p className="mt-0.5 text-xs text-muted-foreground">{room ? online ? "Automatic reconnect is on." : "Waiting for your internet connection." : "Connect to a camera link you trust."}</p>
+                      <p className="text-sm font-medium">
+                        {viewerIsConnected
+                          ? "Live camera connected"
+                          : room
+                            ? status === "retrying"
+                              ? "Reconnecting to camera"
+                              : "Connecting to camera"
+                            : "Waiting for a link"}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {room
+                          ? online
+                            ? "Automatic reconnect is on."
+                            : "Waiting for your internet connection."
+                          : "Connect to a camera link you trust."}
+                      </p>
                     </div>
                   </div>
-                  {room && <Button variant="ghost" size="sm" onClick={() => { setRoom(null); setViewerInput(""); setStatus("offline"); setRemoteBattery(null); setRemoteStream(null); window.history.replaceState({}, "", window.location.pathname); }} className="text-muted-foreground"><X className="mr-1.5 size-3.5" /> Disconnect</Button>}
+                  {room && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        try {
+                          localStorage.removeItem(VIEWER_ROOM_STORAGE_KEY);
+                        } catch {
+                          setViewerError(
+                            "Disconnected, but this browser could not clear the saved pairing.",
+                          );
+                        }
+                        setRoom(null);
+                        setViewerInput("");
+                        setStatus("offline");
+                        setRemoteBattery(null);
+                        setRemoteStream(null);
+                        window.history.replaceState({}, "", window.location.pathname);
+                      }}
+                      className="text-muted-foreground"
+                    >
+                      <X className="mr-1.5 size-3.5" /> Disconnect
+                    </Button>
+                  )}
                 </div>
                 <div className="flex items-start gap-2.5 py-3 text-[11px] leading-5 text-muted-foreground">
                   <ShieldCheck className="mt-0.5 size-3.5 shrink-0 text-[var(--cyan)]" />
@@ -703,29 +1176,82 @@ function Keepwatch() {
               <SectionLabel index="A" title="DEVICE" />
               <div className="mt-3 divide-y divide-border/70">
                 <DetailRow
-                  icon={battery?.charging ? BatteryCharging : battery && battery.level <= 20 ? BatteryWarning : Activity}
+                  icon={
+                    battery?.charging
+                      ? BatteryCharging
+                      : battery && battery.level <= 20
+                        ? BatteryWarning
+                        : Activity
+                  }
                   label="Battery level"
-                  value={battery ? `${battery.level}%` : batterySupported ? "Checking" : "Not available"}
+                  value={
+                    battery ? `${battery.level}%` : batterySupported ? "Checking" : "Not available"
+                  }
                   valueTone={battery && battery.level <= 20 ? "coral" : undefined}
-                  detail={battery ? battery.charging ? "Charging" : "On battery" : batterySupported ? "Phone browser may not share this" : "Device privacy setting"}
+                  detail={
+                    battery
+                      ? battery.charging
+                        ? "Charging"
+                        : "On battery"
+                      : batterySupported
+                        ? "Phone browser may not share this"
+                        : "Device privacy setting"
+                  }
                   level={battery?.level}
                 />
-                <DetailRow icon={online ? Signal : WifiOff} label="Connection" value={online ? networkType.toUpperCase() : "Offline"} valueTone={online ? "signal" : "coral"} detail={online ? "Automatic reconnect on" : "Retrying automatically"} />
-                <DetailRow icon={Camera} label="Camera status" value={cameraActive ? "Active" : "Standby"} valueTone={cameraActive ? "signal" : undefined} detail={cameraActive ? streamSize : "Starts only when you tap"} />
-                <DetailRow icon={Zap} label="Stream quality" value={cameraActive ? "HD" : "Ready"} detail={cameraActive ? "Up to 720p · peer to peer" : "Up to 720p · no recording"} />
+                <DetailRow
+                  icon={online ? Signal : WifiOff}
+                  label="Connection"
+                  value={online ? networkType.toUpperCase() : "Offline"}
+                  valueTone={online ? "signal" : "coral"}
+                  detail={online ? "Automatic reconnect on" : "Retrying automatically"}
+                />
+                <DetailRow
+                  icon={Camera}
+                  label="Camera status"
+                  value={cameraActive ? "Active" : cameraPaired ? "Paired · standby" : "Unpaired"}
+                  valueTone={cameraActive ? "signal" : undefined}
+                  detail={
+                    cameraActive
+                      ? streamSize
+                      : cameraPaired
+                        ? "Starts when a viewer joins"
+                        : "Pair to create a viewing link"
+                  }
+                />
+                <DetailRow
+                  icon={Zap}
+                  label="Stream quality"
+                  value={cameraActive ? "HD" : "Ready"}
+                  detail={cameraActive ? "Up to 720p · peer to peer" : "Up to 720p · no recording"}
+                />
               </div>
             </section>
 
             <section className="border-t border-border/80 pt-5">
               <SectionLabel index="B" title="CONNECTION" />
               <div className="mt-3 flex items-start gap-3">
-                <div className={`mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-sm ${status === "connected" ? "bg-[var(--signal-muted)] text-[var(--signal)]" : "bg-secondary text-muted-foreground"}`}>
-                  {status === "connected" ? <Radio className="size-4" /> : online ? <Wifi className="size-4" /> : <WifiOff className="size-4" />}
+                <div
+                  className={`mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-sm ${status === "connected" ? "bg-[var(--signal-muted)] text-[var(--signal)]" : "bg-secondary text-muted-foreground"}`}
+                >
+                  {status === "connected" ? (
+                    <Radio className="size-4" />
+                  ) : online ? (
+                    <Wifi className="size-4" />
+                  ) : (
+                    <WifiOff className="size-4" />
+                  )}
                 </div>
                 <div>
-                  <p className="text-sm font-medium">{connectionLabel(mode, status, cameraActive, room)}</p>
+                  <p className="text-sm font-medium">
+                    {connectionLabel(mode, status, cameraActive, room, cameraPaired)}
+                  </p>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    {status === "connected" ? "Direct, private video between devices." : online ? "We look for your camera again if Wi-Fi drops." : "Keeps checking while the app is open."}
+                    {status === "connected"
+                      ? "Direct, private video between devices."
+                      : online
+                        ? "We look for your camera again if Wi-Fi drops."
+                        : "Keeps checking while the app is open."}
                   </p>
                 </div>
               </div>
@@ -744,22 +1270,37 @@ function Keepwatch() {
               <section className="border-t border-border/80 pt-5" aria-live="polite">
                 <SectionLabel index="D" title="CAMERA DEVICE" />
                 <div className="mt-3 flex items-center gap-3">
-                  {remoteBattery.charging ? <BatteryCharging className="size-4 text-[var(--signal)]" /> : <Activity className="size-4 text-muted-foreground" />}
-                  <span className="text-sm">{remoteBattery.level}% battery{remoteBattery.charging ? " · charging" : ""}</span>
+                  {remoteBattery.charging ? (
+                    <BatteryCharging className="size-4 text-[var(--signal)]" />
+                  ) : (
+                    <Activity className="size-4 text-muted-foreground" />
+                  )}
+                  <span className="text-sm">
+                    {remoteBattery.level}% battery{remoteBattery.charging ? " · charging" : ""}
+                  </span>
                 </div>
               </section>
             )}
 
             <div className="mt-auto hidden border-t border-border/70 pt-4 lg:block">
-              <p className="mono-data flex items-center gap-1.5 text-[10px] uppercase text-muted-foreground"><ShieldCheck className="size-3 text-[var(--signal)]" /> Private by design</p>
-              <p className="mt-2 text-[10px] leading-5 text-muted-foreground">A little peace of mind, wherever you are.</p>
+              <p className="mono-data flex items-center gap-1.5 text-[10px] uppercase text-muted-foreground">
+                <ShieldCheck className="size-3 text-[var(--signal)]" /> Private by design
+              </p>
+              <p className="mt-2 text-[10px] leading-5 text-muted-foreground">
+                A little peace of mind, wherever you are.
+              </p>
             </div>
           </aside>
         </div>
 
         <footer className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-border/80 pt-4 lg:mt-10">
-          <div className="flex items-center gap-2 text-[10px] text-muted-foreground"><ShieldCheck className="size-3.5 text-[var(--signal)]" /><span>Video travels directly between your devices.</span></div>
-          <span className="mono-data text-[9px] uppercase text-muted-foreground/70">KEEPWATCH · WATCH WITH CARE</span>
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <ShieldCheck className="size-3.5 text-[var(--signal)]" />
+            <span>Video travels directly between your devices.</span>
+          </div>
+          <span className="mono-data text-[9px] uppercase text-muted-foreground/70">
+            KEEPWATCH · WATCH WITH CARE
+          </span>
         </footer>
       </div>
     </main>
@@ -767,27 +1308,57 @@ function Keepwatch() {
 }
 
 function BrandMark() {
-  return <span className="relative flex size-8 items-center justify-center rounded-[3px] bg-primary" aria-hidden="true">
-    <Camera className="size-[17px] text-primary-foreground" strokeWidth={2.3} />
-    <span className="absolute right-[5px] top-[5px] size-1.5 rounded-full bg-[var(--coral)]" />
-  </span>;
+  return (
+    <span
+      className="relative flex size-8 items-center justify-center rounded-[3px] bg-primary"
+      aria-hidden="true"
+    >
+      <Camera className="size-[17px] text-primary-foreground" strokeWidth={2.3} />
+      <span className="absolute right-[5px] top-[5px] size-1.5 rounded-full bg-[var(--coral)]" />
+    </span>
+  );
 }
 
 function LiveBadge({ label, active = true }: { label: string; active?: boolean }) {
-  return <Badge variant="outline" className={`h-7 rounded-sm border-border px-2.5 text-[10px] font-medium ${active ? "text-[var(--signal)]" : "text-muted-foreground"}`}>
-    <span className={`mr-1.5 size-1.5 rounded-full ${active ? "animate-pulse bg-[var(--signal)]" : "bg-muted-foreground/50"}`} />{label}
-  </Badge>;
+  return (
+    <Badge
+      variant="outline"
+      className={`h-7 rounded-sm border-border px-2.5 text-[10px] font-medium ${active ? "text-[var(--signal)]" : "text-muted-foreground"}`}
+    >
+      <span
+        className={`mr-1.5 size-1.5 rounded-full ${active ? "animate-pulse bg-[var(--signal)]" : "bg-muted-foreground/50"}`}
+      />
+      {label}
+    </Badge>
+  );
 }
 
 function OnAirChip() {
-  return <span className="flex items-center gap-1.5 rounded-sm bg-[var(--coral)] px-2 py-1 text-[10px] font-semibold text-[var(--primary-foreground)]"><CircleDot className="size-3" /> ON AIR</span>;
+  return (
+    <span className="flex items-center gap-1.5 rounded-sm bg-[var(--coral)] px-2 py-1 text-[10px] font-semibold text-[var(--primary-foreground)]">
+      <CircleDot className="size-3" /> ON AIR
+    </span>
+  );
 }
 
 function SectionLabel({ index, title }: { index: string; title: string }) {
-  return <h2 className="mono-data flex items-center gap-2 text-[10px] font-medium text-muted-foreground"><span className="text-primary">{index}</span><span className="h-px w-4 bg-border" />{title}</h2>;
+  return (
+    <h2 className="mono-data flex items-center gap-2 text-[10px] font-medium text-muted-foreground">
+      <span className="text-primary">{index}</span>
+      <span className="h-px w-4 bg-border" />
+      {title}
+    </h2>
+  );
 }
 
-function DetailRow({ icon: Icon, label, value, detail, level, valueTone }: {
+function DetailRow({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  level,
+  valueTone,
+}: {
   icon: typeof Activity;
   label: string;
   value: string;
@@ -795,24 +1366,54 @@ function DetailRow({ icon: Icon, label, value, detail, level, valueTone }: {
   level?: number;
   valueTone?: "signal" | "coral";
 }) {
-  return <div className="flex min-h-[68px] items-center gap-3 py-2.5">
-    <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-secondary text-muted-foreground"><Icon className={`size-4 ${valueTone === "signal" ? "text-[var(--signal)]" : valueTone === "coral" ? "text-[var(--coral)]" : ""}`} strokeWidth={1.8} /></div>
-    <div className="min-w-0 flex-1">
-      <p className="text-xs font-medium text-foreground">{label}</p>
-      <p className="mt-0.5 truncate text-[10px] text-muted-foreground">{detail}</p>
-      {level !== undefined && <div className="mt-1.5 h-1 w-full max-w-28 overflow-hidden rounded-full bg-secondary"><div className={`h-full rounded-full transition-[width] ${level <= 20 ? "bg-[var(--coral)]" : "bg-[var(--signal)]"}`} style={{ width: `${level}%` }} /></div>}
+  return (
+    <div className="flex min-h-[68px] items-center gap-3 py-2.5">
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-secondary text-muted-foreground">
+        <Icon
+          className={`size-4 ${valueTone === "signal" ? "text-[var(--signal)]" : valueTone === "coral" ? "text-[var(--coral)]" : ""}`}
+          strokeWidth={1.8}
+        />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">{label}</p>
+        <p className="mt-0.5 truncate text-[10px] text-muted-foreground">{detail}</p>
+        {level !== undefined && (
+          <div className="mt-1.5 h-1 w-full max-w-28 overflow-hidden rounded-full bg-secondary">
+            <div
+              className={`h-full rounded-full transition-[width] ${level <= 20 ? "bg-[var(--coral)]" : "bg-[var(--signal)]"}`}
+              style={{ width: `${level}%` }}
+            />
+          </div>
+        )}
+      </div>
+      <span
+        className={`mono-data shrink-0 text-xs ${valueTone === "signal" ? "text-[var(--signal)]" : valueTone === "coral" ? "text-[var(--coral)]" : "text-foreground/85"}`}
+      >
+        {value}
+      </span>
     </div>
-    <span className={`mono-data shrink-0 text-xs ${valueTone === "signal" ? "text-[var(--signal)]" : valueTone === "coral" ? "text-[var(--coral)]" : "text-foreground/85"}`}>{value}</span>
-  </div>;
+  );
 }
 
 function FeatureLine({ icon: Icon, text }: { icon: typeof Activity; text: string }) {
-  return <div className="flex items-center gap-2.5 text-xs text-muted-foreground"><Icon className="size-3.5 shrink-0 text-[var(--cyan)]" strokeWidth={1.8} /><span>{text}</span></div>;
+  return (
+    <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
+      <Icon className="size-3.5 shrink-0 text-[var(--cyan)]" strokeWidth={1.8} />
+      <span>{text}</span>
+    </div>
+  );
 }
 
-function connectionLabel(mode: AppMode, status: ConnectionStatus, cameraActive: boolean, room: string | null) {
+function connectionLabel(
+  mode: AppMode,
+  status: ConnectionStatus,
+  cameraActive: boolean,
+  room: string | null,
+  cameraPaired: boolean,
+) {
   if (!navigator.onLine) return "Waiting for internet";
-  if (mode === "camera" && !cameraActive) return "Camera in standby";
+  if (mode === "camera" && !cameraPaired) return "Camera not paired";
+  if (mode === "camera" && !cameraActive) return "Paired · waiting for viewer";
   if (mode === "camera" && status === "connected") return "Viewer connected";
   if (mode === "camera") return "Waiting for viewer";
   if (!room) return "Waiting for camera link";
